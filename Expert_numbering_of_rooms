@@ -1,0 +1,327 @@
+;; ============================================================
+;; Нумерация объектов на указанном слое
+;; Команда: START_NUMROOMS_LAYER
+;;
+;; Что делает:
+;; - Запрашивает слой, объекты которого нужно нумеровать
+;; - Нумерует объекты на этом слое
+;; - Штриховки в этой программе НЕ учитываются
+;; - Для каждого объекта берёт центр bounding box
+;; - Создаёт MTEXT в слое "экспертиза номера помещений"
+;; - Высота текста 300
+;; - Цвет красный
+;; - Стиль текста: FZ_TIMES (times.ttf)
+;;
+;; ВАЖНО:
+;; - Перед новой нумерацией удаляет старые TEXT/MTEXT
+;;   в слое "экспертиза номера помещений"
+;; - На одном объекте создаётся только один уникальный номер
+;;
+;; ДОБАВЛЕНО:
+;; - Ручное смещение номеров через настройки:
+;;   *fz_num_offset_x* и *fz_num_offset_y*
+;; ============================================================
+
+(vl-load-com)
+
+;; ---------- настройки ----------
+(setq *fz_num_layer*              "экспертиза номера помещений")
+(setq *fz_num_text_height*        300.0)
+(setq *fz_num_text_style*         "FZ_TIMES")
+(setq *fz_num_text_font*          "times.ttf")
+(setq *fz_num_text_width*         1000.0)
+
+;; Ручное смещение номера относительно центра объекта:
+;; +X = вправо, -X = влево
+;; +Y = вверх,   -Y = вниз
+(setq *fz_num_offset_x*           0.0)
+(setq *fz_num_offset_y*           0.0)
+
+;; ============================================================
+;; ВСПОМОГАТЕЛЬНЫЕ
+;; ============================================================
+
+(defun fz:trim (s)
+  (vl-string-trim " \t\r\n" (if s s ""))
+)
+
+(defun fz:str-eq-ci (a b)
+  (= (strcase (if a a "")) (strcase (if b b "")))
+)
+
+(defun fz:uniq-add (lst x)
+  (if (member x lst) lst (cons x lst))
+)
+
+(defun fz:vla-object-p (x)
+  (= (type x) 'VLA-OBJECT)
+)
+
+(defun fz:try-variant-value (x / r)
+  (setq r (vl-catch-all-apply 'vlax-variant-value (list x)))
+  (if (vl-catch-all-error-p r) nil r)
+)
+
+(defun fz:try-safearray->list (x / r)
+  (setq r (vl-catch-all-apply 'vlax-safearray->list (list x)))
+  (if (vl-catch-all-error-p r) nil r)
+)
+
+(defun fz:variant->list-safe (v / vv lst)
+  (cond
+    ((null v) nil)
+    ((setq vv (fz:try-variant-value v))
+      (fz:variant->list-safe vv)
+    )
+    ((setq lst (fz:try-safearray->list v))
+      lst
+    )
+    ((listp v)
+      v
+    )
+    (T nil)
+  )
+)
+
+(defun fz:handle-str (ename / ed)
+  (setq ed (entget ename))
+  (cdr (assoc 5 ed))
+)
+
+(defun fz:bbox-center (bb)
+  (list
+    (/ (+ (nth 0 bb) (nth 2 bb)) 2.0)
+    (/ (+ (nth 1 bb) (nth 3 bb)) 2.0)
+    0.0
+  )
+)
+
+(defun fz:apply-offset (pt)
+  (list
+    (+ (car pt)  *fz_num_offset_x*)
+    (+ (cadr pt) *fz_num_offset_y*)
+    (if (caddr pt) (caddr pt) 0.0)
+  )
+)
+
+(defun fz:item-less-p (a b / p1 p2 x1 y1 x2 y2)
+  ;; сортировка: сверху вниз, при равенстве слева направо
+  (setq p1 (cadr a))
+  (setq p2 (cadr b))
+  (setq x1 (car p1))
+  (setq y1 (cadr p1))
+  (setq x2 (car p2))
+  (setq y2 (cadr p2))
+
+  (if (= y1 y2)
+    (< x1 x2)
+    (> y1 y2)
+  )
+)
+
+(defun fz:ensure-layer (/ doc layers lay)
+  (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
+  (setq layers (vla-get-Layers doc))
+
+  (if (not (tblsearch "LAYER" *fz_num_layer*))
+    (progn
+      (setq lay (vla-Add layers *fz_num_layer*))
+      (vla-put-Color lay 1)
+    )
+    (setq lay (vla-Item layers *fz_num_layer*))
+  )
+
+  lay
+)
+
+(defun fz:ensure-text-style ()
+  (if (not (tblsearch "STYLE" *fz_num_text_style*))
+    (entmakex
+      (list
+        '(0 . "STYLE")
+        '(100 . "AcDbSymbolTableRecord")
+        '(100 . "AcDbTextStyleTableRecord")
+        (cons 2 *fz_num_text_style*)
+        '(70 . 0)
+        '(40 . 0.0)
+        '(41 . 1.0)
+        '(50 . 0.0)
+        '(71 . 0)
+        '(42 . 0.2)
+        (cons 3 *fz_num_text_font*)
+        (cons 4 "")
+      )
+    )
+  )
+)
+
+(defun fz:delete-old-numbers (/ ss i en)
+  (setq ss (ssget "X" (list (cons 0 "TEXT,MTEXT") (cons 8 *fz_num_layer*))))
+  (if ss
+    (progn
+      (setq i 0)
+      (while (< i (sslength ss))
+        (setq en (ssname ss i))
+        (entdel en)
+        (setq i (1+ i))
+      )
+    )
+  )
+)
+
+(defun fz:get-target-space (/ doc)
+  (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
+  (if (= (getvar "CVPORT") 1)
+    (if (= (getvar "TILEMODE") 0)
+      (vla-get-PaperSpace doc)
+      (vla-get-ModelSpace doc)
+    )
+    (vla-get-ModelSpace doc)
+  )
+)
+
+(defun fz:add-number-mtext (pt txt / space obj inspt)
+  (setq space (fz:get-target-space))
+  (setq inspt (fz:apply-offset pt))
+  (setq obj (vla-AddMText space (vlax-3d-point inspt) *fz_num_text_width* txt))
+
+  (vla-put-Layer obj *fz_num_layer*)
+  (vla-put-StyleName obj *fz_num_text_style*)
+  (vla-put-Height obj *fz_num_text_height*)
+  (vla-put-Color obj 1)
+  (vla-put-AttachmentPoint obj 5)
+  (vla-put-Lineweight obj -1)
+
+  obj
+)
+
+(defun fz:numberable-entity-p (ename / ed typ)
+  (setq ed  (entget ename))
+  (setq typ (cdr (assoc 0 ed)))
+
+  ;; Штриховки, тексты, размеры и служебные объекты не учитываем
+  (and
+    typ
+    (not (member (strcase typ)
+      '("HATCH" "TEXT" "MTEXT" "DIMENSION" "ATTDEF" "ATTRIB" "POINT" "XLINE" "RAY" "VIEWPORT")
+    ))
+  )
+)
+
+(defun fz:get-bbox (ename / obj min max res mn mx)
+  (setq obj (vlax-ename->vla-object ename))
+  (setq res (vl-catch-all-apply 'vla-GetBoundingBox (list obj 'min 'max)))
+
+  (if (vl-catch-all-error-p res)
+    nil
+    (progn
+      (setq mn (fz:variant->list-safe min))
+      (setq mx (fz:variant->list-safe max))
+      (if (and mn mx (>= (length mn) 2) (>= (length mx) 2))
+        (list (car mn) (cadr mn) (car mx) (cadr mx))
+        nil
+      )
+    )
+  )
+)
+
+(defun fz:collect-numberable-entities-by-layer (layer / ss i en out seen bb ctr hnd)
+  (setq out '())
+  (setq seen '())
+
+  (if (and layer (> (strlen layer) 0) (tblsearch "LAYER" layer))
+    (progn
+      (setq ss (ssget "X" (list (cons 8 layer))))
+      (if ss
+        (progn
+          (setq i 0)
+          (while (< i (sslength ss))
+            (setq en (ssname ss i))
+            (setq hnd (fz:handle-str en))
+
+            (if (and
+                  (not (member hnd seen))
+                  (fz:numberable-entity-p en)
+                )
+              (progn
+                (setq bb (fz:get-bbox en))
+                (if bb
+                  (progn
+                    (setq ctr (fz:bbox-center bb))
+                    (setq out (cons (list en ctr hnd) out))
+                    (setq seen (cons hnd seen))
+                  )
+                )
+              )
+            )
+
+            (setq i (1+ i))
+          )
+        )
+      )
+    )
+  )
+
+  (vl-sort out 'fz:item-less-p)
+)
+
+;; ============================================================
+;; КОМАНДА
+;; ============================================================
+
+(defun c:START_NUMROOMS_LAYER (/ srcLayer objs item en inspt num cnt)
+  (princ "\n--- Нумерация объектов на указанном слое ---")
+
+  (setq srcLayer (fz:trim (getstring T "\nВведите слой, объекты которого нужно нумеровать: ")))
+
+  (if (= srcLayer "")
+    (progn
+      (princ "\nСлой не введён.")
+      (princ)
+    )
+    (if (not (tblsearch "LAYER" srcLayer))
+      (progn
+        (princ (strcat "\nСлой не найден: " srcLayer))
+        (princ)
+      )
+      (progn
+        (fz:ensure-layer)
+        (fz:ensure-text-style)
+        (fz:delete-old-numbers)
+
+        (setq objs (fz:collect-numberable-entities-by-layer srcLayer))
+
+        (if (or (null objs) (= (length objs) 0))
+          (progn
+            (princ "\nПодходящие объекты на указанном слое не найдены.")
+            (princ)
+          )
+          (progn
+            (setq num 1)
+            (setq cnt 0)
+
+            (foreach item objs
+              (setq en    (car item))
+              (setq inspt (cadr item))
+              (fz:add-number-mtext inspt (itoa num))
+              (setq num (1+ num))
+              (setq cnt (1+ cnt))
+            )
+
+            (princ (strcat "\nГотово. Пронумеровано объектов: " (itoa cnt)))
+            (princ (strcat "\nСлой исходных объектов: " srcLayer))
+            (princ (strcat "\nСлой номеров: " *fz_num_layer*))
+            (princ (strcat "\nСтиль текста: " *fz_num_text_style*))
+            (princ (strcat "\nВысота текста: " (rtos *fz_num_text_height* 2 0)))
+            (princ (strcat "\nСмещение по X: " (rtos *fz_num_offset_x* 2 2)))
+            (princ (strcat "\nСмещение по Y: " (rtos *fz_num_offset_y* 2 2)))
+            (princ)
+          )
+        )
+      )
+    )
+  )
+)
+
+(princ "\nЗагружено. Команда: START_NUMROOMS_LAYER")
+(princ)
